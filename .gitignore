@@ -1,0 +1,29 @@
+# Data: transcripts, metadata, and generated summaries
+cache/
+summaries/
+
+# Python / uv
+.venv/
+.python-version
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.uv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# macOS
+.DS_Store

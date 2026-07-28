@@ -1,0 +1,78 @@
+[project]
+name = "yt-summarizer"
+version = "0.1.0"
+description = "Batch-summarize YouTube videos with subscription-backed AI CLIs"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Matt Thorson" }]
+requires-python = ">=3.10"
+keywords = ["youtube", "summarization", "codex", "claude", "transcription"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "platformdirs>=4.2.0",
+    "rich>=13.7.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+    "yt-dlp>=2024.8.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/mthorson/yt-summarizer"
+Repository = "https://github.com/mthorson/yt-summarizer"
+Issues = "https://github.com/mthorson/yt-summarizer/issues"
+
+[project.optional-dependencies]
+# Local transcription fallback for videos that have no captions.
+# Install with:  uv sync --extra whisper
+whisper = ["faster-whisper>=1.0.0"]
+
+[dependency-groups]
+dev = [
+    "coverage[toml]>=7.6",
+    "mypy>=1.10",
+    "ruff>=0.6",
+    "types-setuptools",
+]
+
+[project.scripts]
+yts = "yt_summarizer.cli:main"
+yt-summarizer = "yt_summarizer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["yt_summarizer"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["yt_summarizer"]
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
