@@ -32,6 +32,7 @@ def get_info(url: str) -> dict:
         "skip_download": True,
         "writesubtitles": False,
         "writeautomaticsub": False,
+        "js_runtimes": {"deno": {}, "node": {}},
     }
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -43,10 +44,16 @@ def get_info(url: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Captions
 # --------------------------------------------------------------------------- #
-def _pick_track(tracks: dict, lang: str) -> tuple[str, list] | None:
+def _pick_track(
+    tracks: dict, lang: str, *, prefer_original: bool = False
+) -> tuple[str, list] | None:
     """Return (language code, formats) while tolerating variants like en-US."""
     if not tracks:
         return None
+    # With dubbed audio, `en` can be a translation of another language while
+    # `en-orig` is the actual English caption track. Prefer the native captions.
+    if prefer_original and f"{lang}-orig" in tracks:
+        return f"{lang}-orig", tracks[f"{lang}-orig"]
     if lang in tracks:
         return lang, tracks[lang]
     for code, track in tracks.items():
@@ -175,7 +182,7 @@ def extract_captions(info: dict, lang: str) -> tuple[str, str, str, list[dict]] 
             text, segments = result
             return text, "captions", actual_lang, segments
 
-    selected = _pick_track(auto, lang)
+    selected = _pick_track(auto, lang, prefer_original=True)
     if selected:
         actual_lang, track = selected
         result = _extract_from_track(track)
@@ -215,6 +222,7 @@ def whisper_transcribe(url: str, model_size: str) -> tuple[str, list[dict]]:
             "noprogress": True,
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
+            "js_runtimes": {"deno": {}, "node": {}},
         }
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)

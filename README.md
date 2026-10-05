@@ -84,6 +84,8 @@ containing one input per line.
 - Windows, macOS, or Linux.
 - A signed-in Claude Code CLI or Codex CLI installation.
 - `uv`, which installs and runs the Python package.
+- Deno or Node.js 22+ on PATH for YouTube's JavaScript challenges. Both are
+  enabled by `yts`; the matching solver scripts are installed with `yt-dlp`.
 - Optional: enough disk space for audio downloads and Whisper models if you use
   `--whisper`.
 
