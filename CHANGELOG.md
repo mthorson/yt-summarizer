@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-12
+
+### Fixed
+
+- Keep PyAV below version 19 to prevent local Whisper transcription from failing
+  with `open() got an unexpected keyword argument 'metadata_errors'`.
+- Prefer original-language captions over translations of dubbed audio tracks.
+
+### Added
+
+- Audio-decoding regression coverage using the installed Whisper dependencies.
+
 ## [0.1.0] - 2026-07-28
 
 ### Added
@@ -23,5 +35,6 @@ All notable changes to this project are documented here. The format follows
 - Tagged GitHub release automation with SHA-256 checksums.
 - Whisper is now an explicitly installed optional dependency.
 
-[Unreleased]: https://github.com/mthorson/yt-summarizer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mthorson/yt-summarizer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mthorson/yt-summarizer/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mthorson/yt-summarizer/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 [project]
 name = "yt-summarizer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Batch-summarize YouTube videos with subscription-backed AI CLIs"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -36,7 +36,11 @@ Issues = "https://github.com/mthorson/yt-summarizer/issues"
 [project.optional-dependencies]
 # Local transcription fallback for videos that have no captions.
 # Install with:  uv sync --extra whisper
-whisper = ["faster-whisper>=1.0.0"]
+whisper = [
+    "faster-whisper>=1.0.0",
+    # faster-whisper 1.2.1 passes metadata_errors, removed in PyAV 19.
+    "av>=11,<19",
+]
 
 [dependency-groups]
 dev = [

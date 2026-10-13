@@ -1979,7 +1979,7 @@ wheels = [
 
 [[package]]
 name = "yt-summarizer"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "platformdirs" },
@@ -1990,6 +1990,7 @@ dependencies = [
 
 [package.optional-dependencies]
 whisper = [
+    { name = "av" },
     { name = "faster-whisper" },
 ]
 
@@ -2003,6 +2004,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", marker = "extra == 'whisper'", specifier = ">=11,<19" },
     { name = "faster-whisper", marker = "extra == 'whisper'", specifier = ">=1.0.0" },
     { name = "platformdirs", specifier = ">=4.2.0" },
     { name = "rich", specifier = ">=13.7.0" },
