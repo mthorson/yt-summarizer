@@ -3,26 +3,33 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import warnings
 import webbrowser
 from pathlib import Path
 from typing import Any
 
-from . import cache, config, fetch, output, summarize
+from yt_dlp.utils import DownloadError
+
+from . import cache, config, fetch, output, prompts, summarize
 from .errors import YtsError
 from .inputs import resolve_inputs, video_id_from_url
-from .progress import ProgressReporter
+from .progress import ProgressReporter, ReporterLogHandler, format_duration
 from .prompts import (
     BUILTIN_PRESETS,
     CUSTOM_SYSTEM_PROMPT,
     DEFAULT_PROMPT,
 )
+from .ytdlp import clean_message
 
 
 def _config_preparse(argv: list[str]) -> str | None:
@@ -125,7 +132,37 @@ def build_parser(settings: dict[str, Any] | None = None) -> argparse.ArgumentPar
         "-l",
         "--lang",
         default=config.setting(settings, "language", "en"),
-        help="Preferred caption language.",
+        help="Preferred caption (transcript) language. Default: en.",
+    )
+    p.add_argument(
+        "-sl",
+        "--summary-lang",
+        metavar="LANG",
+        default=config.setting(settings, "summary_language", None),
+        help=(
+            "Language to write the summary in, e.g. tr, en, de, or a language "
+            "name. Independent of --lang. Default: English (or summary_language "
+            "in the config file)."
+        ),
+    )
+    cookies = p.add_mutually_exclusive_group()
+    cookies.add_argument(
+        "--cookies", metavar="FILE", help="Read YouTube cookies from a Netscape file."
+    )
+    cookies.add_argument(
+        "--cookies-from-browser",
+        choices=[
+            "brave",
+            "chrome",
+            "chromium",
+            "edge",
+            "firefox",
+            "opera",
+            "safari",
+            "vivaldi",
+            "whale",
+        ],
+        help="Use the selected browser's cookies for YouTube requests.",
     )
     p.add_argument(
         "-W",
@@ -143,6 +180,12 @@ def build_parser(settings: dict[str, Any] | None = None) -> argparse.ArgumentPar
         "--whisper-model",
         default=config.setting(settings, "whisper_model", "base"),
         help="faster-whisper model size.",
+    )
+    p.add_argument(
+        "--whisper-device",
+        choices=["auto", "cuda", "cpu"],
+        default=config.setting(settings, "whisper_device", "auto"),
+        help="Whisper device. cuda requires GPU support and never falls back to CPU.",
     )
     p.add_argument("-f", "--force", action="store_true", help="Regenerate output.")
     p.add_argument(
@@ -187,7 +230,10 @@ def build_parser(settings: dict[str, Any] | None = None) -> argparse.ArgumentPar
         "-d", "--doctor", action="store_true", help="Check local readiness and exit."
     )
     p.add_argument(
-        "-v", "--verbose", action="store_true", help="Include exception details."
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show every step, library warnings, and full error details.",
     )
     return p
 
@@ -214,6 +260,17 @@ def _load_task(args, settings: dict[str, Any]) -> tuple[str, str]:
     return args.task or args.preset, presets[args.preset]
 
 
+def _youtube_options(args) -> dict:
+    cookie_file = getattr(args, "cookies", None)
+    if cookie_file:
+        path = Path(cookie_file).expanduser()
+        if not path.is_file():
+            raise YtsError(f"Cookie file does not exist: {path}")
+        return {"cookiefile": str(path)}
+    browser = getattr(args, "cookies_from_browser", None)
+    return {"cookiesfrombrowser": (browser,)} if browser else {}
+
+
 def _get_record(url: str, args, reporter: ProgressReporter) -> dict:
     video_id = video_id_from_url(url)
     if not args.refetch and video_id:
@@ -222,8 +279,10 @@ def _get_record(url: str, args, reporter: ProgressReporter) -> dict:
             reporter.phase("using cached transcript")
             return cached
 
-    reporter.phase("fetching metadata")
-    info = fetch.get_info(url)
+    reporter.phase("fetching video info")
+    youtube_options = _youtube_options(args)
+    info = fetch.get_info(url, ydl_opts=youtube_options)
+    reporter.set_title(str(info.get("title") or ""))
     video_id = info.get("id")
     channel = output.sanitize_channel(
         str(info.get("channel") or info.get("uploader") or "")
@@ -236,12 +295,23 @@ def _get_record(url: str, args, reporter: ProgressReporter) -> dict:
 
     reporter.phase("fetching captions")
     force_whisper = getattr(args, "force_whisper", False)
-    result = None if force_whisper else fetch.extract_captions(info, args.lang)
+    result = (
+        None
+        if force_whisper
+        else fetch.extract_captions(info, args.lang, ydl_opts=youtube_options)
+    )
     if result:
         transcript, source, lang, segments = result
     elif args.whisper or force_whisper:
-        reporter.phase(f"transcribing with Whisper ({args.whisper_model})")
-        transcript, segments = fetch.whisper_transcribe(url, args.whisper_model)
+        whisper_device = getattr(args, "whisper_device", "auto")
+        reporter.phase("no captions, using Whisper")
+        transcript, segments = fetch.whisper_transcribe(
+            url,
+            args.whisper_model,
+            device=whisper_device,
+            ydl_opts=youtube_options,
+            on_progress=lambda message: reporter.phase(f"Whisper: {message}"),
+        )
         source, lang = "whisper", args.lang
     else:
         raise fetch.FetchError(
@@ -337,15 +407,36 @@ def _summarize_record(
     return summarize.summarize(synthesis, user_prompt=synthesis_prompt, **common)
 
 
-def _validate_result(task: str, text: str) -> None:
+def _fold(text: str) -> str:
+    # casefold() maps Turkish dotted/dotless I inconsistently; normalise them.
+    return text.replace("İ", "i").replace("I", "i").replace("ı", "i").casefold()
+
+
+def localize_prompt(prompt: str, language: str | None) -> str:
+    """Apply --summary-lang to the selected instruction."""
+    if not language:
+        return prompt
+    if prompt == DEFAULT_PROMPT:
+        prompt = prompts.summary_prompt(language)
+    return f"{prompt}\n\n{prompts.language_instruction(language)}"
+
+
+def expected_headings(
+    task: str, prompt: str, language: str | None
+) -> tuple[str, ...] | None:
+    """Headings the built-in summary must contain, or None to skip the check."""
+    if task != "summary" or prompt != localize_prompt(DEFAULT_PROMPT, language):
+        return None
+    return prompts.SUMMARY_HEADINGS.get(language or "en")
+
+
+def _validate_result(
+    task: str, text: str, headings: tuple[str, ...] | None = ("TL;DR", "Key takeaways")
+) -> None:
     if not text.strip():
         raise summarize.SummarizeError("Writer returned empty Markdown")
-    if task == "summary":
-        missing = [
-            label
-            for label in ("TL;DR", "Key takeaways")
-            if label.lower() not in text.lower()
-        ]
+    if task == "summary" and headings:
+        missing = [label for label in headings if _fold(label) not in _fold(text)]
         if missing:
             raise summarize.SummarizeError(
                 "Writer output did not follow the summary format; missing "
@@ -361,8 +452,14 @@ def process_one(
     reporter: ProgressReporter,
     task: str | None = None,
 ) -> tuple[str, str]:
-    task = task or ("summary" if user_prompt == DEFAULT_PROMPT else "custom")
+    language = getattr(args, "summary_lang", None)
+    task = task or (
+        "summary"
+        if user_prompt == localize_prompt(DEFAULT_PROMPT, language)
+        else "custom"
+    )
     record = _get_record(url, args, reporter)
+    reporter.set_title(str(record.get("title") or ""))
     channel = output.sanitize_channel(str(record.get("channel") or ""))
     model = summarize.choose_model(
         record["transcript"], args.model, args.long_threshold, writer=writer
@@ -382,7 +479,7 @@ def process_one(
 
     reporter.phase(f"summarizing with {writer}:{model_label}")
     summary = _summarize_record(record, args, user_prompt, writer, model, reporter)
-    _validate_result(task, summary)
+    _validate_result(task, summary, expected_headings(task, user_prompt, language))
     writer_model = f"{writer}:{model_label}"
     reporter.phase("writing summary")
     path = output.write_summary(
@@ -405,6 +502,8 @@ def _version_for(command: str, *version_args: str) -> str:
         proc = subprocess.run(
             [command, *version_args],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
         )
@@ -481,8 +580,114 @@ def _write_report(path: str, report: dict) -> None:
     os.replace(tmp, selected)
 
 
+_ERROR_HINTS: list[tuple[tuple[str, ...], str, str | None]] = [
+    # (substrings to look for, short message, hint)
+    (
+        ("sign in to confirm", "not a bot"),
+        "YouTube asked for a sign-in (bot check).",
+        "Pass --cookies youtube-cookies.txt or --cookies-from-browser firefox.",
+    ),
+    (
+        ("members-only", "join this channel", "available to this channel's members"),
+        "This video is members-only.",
+        "Use cookies from an account that has access (--cookies / "
+        "--cookies-from-browser).",
+    ),
+    (("private video",), "This video is private.", None),
+    (
+        ("age-restricted", "confirm your age", "inappropriate for some users"),
+        "This video is age-restricted.",
+        "Use cookies from a signed-in account (--cookies / --cookies-from-browser).",
+    ),
+    (
+        ("http error 429", "too many requests"),
+        "YouTube is rate-limiting requests (HTTP 429).",
+        "Wait a while, use cookies, and add a pause between videos, e.g. --sleep 30.",
+    ),
+    (
+        ("video unavailable", "this video has been removed", "is not available"),
+        "The video is unavailable (removed, region-locked, or wrong URL).",
+        None,
+    ),
+    (
+        ("requested format is not available", "no video formats found"),
+        "YouTube did not offer a downloadable audio stream.",
+        "Update yt-dlp (uv tool upgrade yt-summarizer) or try cookies.",
+    ),
+    (
+        ("ssl", "timed out", "connection reset", "getaddrinfo", "network"),
+        "Network error while talking to YouTube.",
+        "Usually temporary; run the same command again.",
+    ),
+]
+
+
+def describe_error(exc: BaseException, verbose: bool = False) -> tuple[str, str | None]:
+    """Turn an exception into one readable line plus an optional hint."""
+    raw = clean_message(str(exc)) or type(exc).__name__
+    if isinstance(exc, DownloadError):
+        lowered = raw.lower()
+        for needles, message, hint in _ERROR_HINTS:
+            if any(needle in lowered for needle in needles):
+                return (f"{message} ({raw})" if verbose else message), hint
+        # Drop yt-dlp's "[youtube] <id>: " prefix; the video is already named.
+        raw = re.sub(r"^\[[^\]]+\]\s*[\w-]+:\s*", "", raw)
+    elif not isinstance(exc, YtsError):
+        raw = f"{type(exc).__name__}: {raw}"
+
+    hint = None
+    lowered = raw.lower()
+    if "timed out after" in lowered:
+        hint = "Increase the writer timeout, e.g. --timeout 1200."
+    elif "whisper gpu" in lowered or "cublas" in lowered or "cudnn" in lowered:
+        hint = (
+            "Use --whisper-device auto (falls back to CPU) or install the GPU "
+            "libraries: uv tool install -e '.[whisper,windows-gpu]'."
+        )
+    elif "not authenticated" in lowered:
+        hint = "Sign in to the writer CLI first, then retry."
+
+    if not verbose:
+        raw = " ".join(raw.split())
+        if len(raw) > 300:
+            raw = raw[:299] + "… (use -v for the full message)"
+    return raw, hint
+
+
+def _display_path(path: str) -> str:
+    try:
+        path = os.path.normpath(path)
+        relative = os.path.relpath(path)
+    except ValueError:
+        return path
+    return path if relative.startswith("..") else relative
+
+
+def _writer_model(status: str) -> str | None:
+    match = re.search(r"\[([^\]]+)\]", status)
+    return match.group(1) if match else None
+
+
+def _read_stdin_inputs() -> list[str]:
+    return [
+        line.strip()
+        for line in sys.stdin
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _safe_streams() -> None:
+    """Never crash on characters the console code page cannot encode."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            with contextlib.suppress(Exception):
+                reconfigure(errors="replace")
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    _safe_streams()
     try:
         settings = config.load(_config_preparse(argv))
         args = build_parser(settings).parse_args(argv)
@@ -493,31 +698,83 @@ def main(argv=None) -> int:
             return 0
         if args.doctor:
             return run_doctor(args)
-        task, user_prompt = _load_task(args, settings)
-        writer = summarize.resolve_writer(args.writer, args.claude_bin, args.codex_bin)
-        writer_command = args.codex_bin if writer == "codex" else args.claude_bin
-        summarize.ensure_writer_compatible(writer, writer_command)
-        summarize.ensure_writer_authenticated(writer, writer_command)
-        raw_inputs = args.inputs
-        if not raw_inputs and not sys.stdin.isatty():
-            raw_inputs = [
-                line.strip()
-                for line in sys.stdin
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
-        urls = resolve_inputs(raw_inputs)
-        if not urls:
-            raise YtsError(
-                "No videos resolved. Pass a YouTube URL, ID, playlist, or file."
-            )
+        task, base_prompt = _load_task(args, settings)
+        args.summary_lang = prompts.normalize_language(args.summary_lang)
+        user_prompt = localize_prompt(base_prompt, args.summary_lang)
+        youtube_options = _youtube_options(args)
     except (YtsError, ValueError, OSError) as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    reporter = ProgressReporter(args.quiet or args.stdout or args.json)
+    reporter = ProgressReporter(
+        quiet=args.quiet or args.stdout or args.json, verbose=args.verbose
+    )
+    # Library warnings (yt-dlp, faster-whisper, Python warnings) go through the
+    # reporter, which only shows them with --verbose.
+    log_handler = ReporterLogHandler(reporter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(log_handler)
+    try:
+        with warnings.catch_warnings():
+            if args.verbose:
+                logging.captureWarnings(True)
+            else:
+                warnings.simplefilter("ignore")
+            return _run(args, task, user_prompt, youtube_options, reporter)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
+    finally:
+        logging.captureWarnings(False)
+        root_logger.removeHandler(log_handler)
+
+
+def _run(
+    args,
+    task: str,
+    user_prompt: str,
+    youtube_options: dict,
+    reporter: ProgressReporter,
+) -> int:
+    started = time.monotonic()
     results: list[dict] = []
     output_paths: list[str] = []
+    summarized = skipped = 0
+
     with reporter:
+        try:
+            reporter.phase(f"checking the {args.writer} writer")
+            writer = summarize.resolve_writer(
+                args.writer, args.claude_bin, args.codex_bin
+            )
+            writer_command = args.codex_bin if writer == "codex" else args.claude_bin
+            summarize.ensure_writer_compatible(writer, writer_command)
+            summarize.ensure_writer_authenticated(writer, writer_command)
+            raw_inputs = args.inputs
+            if not raw_inputs and not sys.stdin.isatty():
+                raw_inputs = _read_stdin_inputs()
+            reporter.phase("reading input list")
+            urls = resolve_inputs(raw_inputs, ydl_opts=youtube_options)
+            if not urls:
+                raise YtsError(
+                    "No videos found. Pass a YouTube URL, video ID, playlist, or "
+                    "a text file with one URL per line."
+                )
+        except (YtsError, ValueError, OSError, DownloadError) as exc:
+            message, hint = describe_error(exc, args.verbose)
+            reporter.error(f"error: {message}")
+            if hint:
+                reporter.error(f"hint: {hint}")
+            return 1
+
+        language = prompts.language_name(args.summary_lang or "en")
+        count = f"{len(urls)} video" + ("s" if len(urls) != 1 else "")
+        reporter.log(
+            f"yts · {count} · {writer} · {task} in {language} "
+            f"→ {_display_path(args.out_dir)}",
+            style="dim",
+        )
+
         reporter.start_batch(len(urls))
         for index, url in enumerate(urls, 1):
             reporter.start_video(index, len(urls), url)
@@ -525,17 +782,9 @@ def main(argv=None) -> int:
                 status, path = process_one(
                     url, args, user_prompt, writer, reporter, task=task
                 )
-                reporter.finish_video(status)
-                results.append(
-                    {"url": url, "status": "ok", "message": status, "path": path}
-                )
-                output_paths.append(path)
-                if args.stdout and not args.json:
-                    print(output.read_generated_content(path))
             except Exception as exc:  # isolate per-video failures
-                message = f"{type(exc).__name__}: {exc}" if args.verbose else str(exc)
-                reporter.error(f"ERROR ({url}): {message}")
-                reporter.finish_video("failed")
+                message, hint = describe_error(exc, args.verbose)
+                reporter.failed(message, hint)
                 results.append(
                     {
                         "url": url,
@@ -544,13 +793,30 @@ def main(argv=None) -> int:
                         "retry": f"yts {shlex.quote(url)}",
                     }
                 )
+            else:
+                shown = _display_path(path)
+                if status.startswith("skip"):
+                    skipped += 1
+                    reporter.skipped("", shown)
+                else:
+                    summarized += 1
+                    model = _writer_model(status)
+                    reporter.succeeded("", shown + (f" [{model}]" if model else ""))
+                results.append(
+                    {"url": url, "status": "ok", "message": status, "path": path}
+                )
+                output_paths.append(path)
+                if args.stdout and not args.json:
+                    print(output.read_generated_content(path), flush=True)
             if args.sleep and index < len(urls):
+                reporter.phase(f"waiting {args.sleep:g}s before the next video")
                 time.sleep(args.sleep)
 
     failed = sum(item["status"] == "failed" for item in results)
     report = {
         "task": task,
         "writer": writer,
+        "summary_language": args.summary_lang or "en",
         "succeeded": len(results) - failed,
         "failed": failed,
         "results": results,
@@ -560,13 +826,27 @@ def main(argv=None) -> int:
         report_path = os.path.join(args.out_dir, "last-run.json")
     if report_path:
         _write_report(report_path, report)
+
+    if len(urls) > 1 or failed:
+        parts = [f"{summarized} summarized"]
+        if skipped:
+            parts.append(f"{skipped} up to date")
+        if failed:
+            parts.append(f"{failed} failed")
+        footer = f"Done in {format_duration(time.monotonic() - started)}: "
+        footer += ", ".join(parts)
+        if report_path and failed:
+            footer += f". Details and retry commands: {_display_path(report_path)}"
+        reporter.log(footer, style="bold")
+
     if args.open:
         for path in output_paths:
             webbrowser.open(Path(path).resolve().as_uri())
     if args.json:
         print(json.dumps(report, ensure_ascii=False))
     elif len(urls) == 1 and output_paths and not (args.quiet or args.stdout):
-        print(Path(output_paths[0]).read_text(encoding="utf-8").rstrip())
+        print()
+        print(output.read_generated_content(output_paths[0]))
     return 2 if failed else 0
 
 

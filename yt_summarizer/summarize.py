@@ -85,6 +85,8 @@ def writer_capabilities(writer: str, command: str) -> tuple[bool, str]:
         proc = subprocess.run(
             help_args,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=10,
         )
@@ -120,6 +122,8 @@ def writer_authentication(writer: str, command: str) -> tuple[bool, str]:
         proc = subprocess.run(
             args,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=10,
         )
@@ -295,6 +299,8 @@ def _summarize_with_claude(
                 cmd,
                 input=message,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=timeout,
                 cwd=tmp,
@@ -351,6 +357,8 @@ def _summarize_with_codex(
                 cmd,
                 input=message,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=timeout,
                 cwd=tmp,

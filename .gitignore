@@ -27,3 +27,6 @@ dist/
 
 # macOS
 .DS_Store
+
+# Personal files: cookies are credentials, never commit them
+*cookies*.txt

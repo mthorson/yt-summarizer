@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -9,6 +10,40 @@ from yt_summarizer.prompts import SALES_INTENT_INSTRUCTION
 
 
 class SummarizeTest(unittest.TestCase):
+    def test_writer_pipes_preserve_utf8_with_a_windows_legacy_locale(self) -> None:
+        expected = "Şimdi Türkçe özet: ığüşöç İĞÜŞÖÇ — 🎬"
+        prompt = "Türkçe özetle: Şimdi 🎬"
+        real_run = subprocess.run
+        # Exercise real pipes with a UTF-8-speaking child process, without an AI
+        # service. Force the default used by text=True on Turkish Windows.
+        script = (
+            "import sys; "
+            "message = sys.stdin.buffer.read().decode('utf-8'); "
+            f"assert {prompt!r} in message; "
+            f"sys.stdout.buffer.write({expected!r}.encode('utf-8')); "
+            "sys.stderr.buffer.write(b'diagnostic: \\xff')"
+        )
+
+        def run_writer(_command, **kwargs):
+            return real_run([sys.executable, "-c", script], **kwargs)
+
+        for writer in ("claude", "codex"):
+            with (
+                self.subTest(writer=writer),
+                mock.patch("subprocess._text_encoding", return_value="cp1254"),
+                mock.patch(
+                    "yt_summarizer.summarize.subprocess.run", side_effect=run_writer
+                ),
+            ):
+                result = summarize.summarize(
+                    {"transcript": "Türkçe konuşma"},
+                    user_prompt=prompt,
+                    system_prompt="System",
+                    model="sonnet" if writer == "claude" else None,
+                    writer=writer,
+                )
+                self.assertEqual(result, expected)
+
     @mock.patch("yt_summarizer.summarize.subprocess.run")
     def test_writer_capability_check_reports_missing_flags(self, run) -> None:
         run.return_value = subprocess.CompletedProcess(

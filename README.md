@@ -2,6 +2,11 @@
 
 Turn YouTube videos into short Markdown summaries from the terminal.
 
+> This is a fork of [mthorson/yt-summarizer](https://github.com/mthorson/yt-summarizer).
+> It adds a configurable summary language (`-sl` / `--summary-lang`), YouTube
+> cookie support, GPU selection for Whisper, and a cleaner console output. See
+> [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Why I built this
 
 I watch a lot of long-form YouTube videos, but I do not always have an hour to
@@ -59,11 +64,15 @@ containing one input per line.
 | `-W`, `--whisper` | Transcribe locally when captions are unavailable. |
 | `--force-whisper` | Ignore captions and transcribe the audio locally. |
 | `-M small`, `--whisper-model small` | Pick the faster-whisper model size. |
+| `--whisper-device cuda` | Require an NVIDIA GPU for Whisper; no CPU fallback. |
 | `-m haiku`, `--model haiku` | Force a Claude model alias. |
 | `-m gpt-5.4`, `--model gpt-5.4` | Select a Codex model. |
 | `-m opus`, `--model opus` | Force Opus for higher quality. |
 | `-T 45000`, `--long-threshold 45000` | Set the long-input threshold. |
-| `-l en`, `--lang en` | Choose the preferred caption language. |
+| `-l en`, `--lang en` | Choose the preferred caption (transcript) language. |
+| `-sl tr`, `--summary-lang tr` | Write the summary in another language. |
+| `--cookies-from-browser firefox` | Use a browser's YouTube session cookies. |
+| `--cookies youtube-cookies.txt` | Use a Netscape-format cookie file instead. |
 | `-f`, `--force` | Regenerate the summary even if the Markdown file exists. |
 | `-r`, `--refetch` | Ignore cached transcript data and fetch again. |
 | `-s 5`, `--sleep 5` | Pause between videos in a batch. |
@@ -73,6 +82,7 @@ containing one input per line.
 | `-p "..."`, `--prompt "..."` | Replace the default summary instruction. |
 | `-P prompt.txt`, `--prompt-file prompt.txt` | Load a prompt from a file. |
 | `-q`, `--quiet` | Suppress progress and single-video stdout output. |
+| `-v`, `--verbose` | Show every step, library warnings, and full errors. |
 | `--stdout` | Print generated Markdown content only. |
 | `--json` | Print a machine-readable run report. |
 | `--report report.json` | Write a machine-readable batch/retry report. |
@@ -134,13 +144,13 @@ with an API key if your goal is to avoid API-based billing.
 From GitHub:
 
 ```sh
-uv tool install git+https://github.com/mthorson/yt-summarizer
+uv tool install git+https://github.com/talha-devp/yt-summarizer
 ```
 
 From a local checkout:
 
 ```sh
-git clone https://github.com/mthorson/yt-summarizer
+git clone https://github.com/talha-devp/yt-summarizer
 cd yt-summarizer
 ./install.sh
 ```
@@ -177,6 +187,27 @@ yts "https://www.youtube.com/watch?v=SOME_VIDEO_ID"
 For a single video, the summary is printed to stdout and written to your
 configured output directory.
 
+### Summary language
+
+Summaries are written in English by default. Pick another output language with
+`-sl` / `--summary-lang`, regardless of the language spoken in the video:
+
+```sh
+yts -sl tr "https://www.youtube.com/watch?v=SOME_VIDEO_ID"   # Turkish
+yts -sl de videos.txt                                          # German
+yts --summary-lang "Azerbaijani" videos.txt                   # any language name
+```
+
+`--lang` and `--summary-lang` are independent: `--lang` picks which caption
+track to read, `--summary-lang` picks the language the summary is written in.
+The built-in summary uses localized headings for common languages (for
+Turkish: **Kısa Özet** and **Öne Çıkan Noktalar**). The language also applies
+to the `actions`, `claims`, `critique`, and custom prompts. To make it the
+default, set `summary_language = "tr"` in the configuration file.
+
+Changing the summary language regenerates the summary on the next run while
+reusing the cached transcript.
+
 Summarize a playlist:
 
 ```sh
@@ -189,13 +220,30 @@ Summarize a list of videos:
 yts videos.txt
 ```
 
-Where `videos.txt` contains one URL or video ID per line:
+The repository ships a ready-to-edit [`videos.txt`](videos.txt). Put one input
+per line; lines starting with `#` and blank lines are ignored. Watch, `youtu.be`,
+`live`, and `shorts` URLs, bare 11-character video IDs, and playlist URLs (which
+expand into their videos) can be mixed in one file:
 
 ```txt
 # Comments and blank lines are ignored.
 https://www.youtube.com/watch?v=SOME_VIDEO_ID
 https://youtu.be/ANOTHER_ID
+https://www.youtube.com/live/LIVE_VIDEO_ID
+dQw4w9WgXcQ
+https://www.youtube.com/playlist?list=SOME_PLAYLIST_ID
 ```
+
+A typical batch run, writing Turkish summaries into `./ozetler`, pausing 10
+seconds between videos, and using local Whisper for videos without captions:
+
+```sh
+yts -w claude -sl tr --whisper --sleep 10 --cookies youtube-cookies.txt -o ozetler videos.txt
+```
+
+Videos that already have an up-to-date summary are skipped, so you can keep
+adding lines to the file and rerun the same command. A batch also writes
+`last-run.json` to the output directory with a retry command for every failure.
 
 Codex is used by default. Choose another writer or automatic fallback:
 
@@ -232,6 +280,26 @@ yts SOMEVIDEOID1
 
 Normal watch URLs summarize the single video, even if the pasted URL includes a
 playlist query parameter. Use a playlist URL when you want a full playlist.
+
+## Console output
+
+While a batch runs, `yts` shows a single live status line (current video, step,
+and elapsed time) and prints exactly one line per finished video:
+
+```text
+yts · 3 videos · claude · summary in Turkish → ozetler
+✓ [1/3] First video title → ozetler\Channel\abc-first-video.md [claude:sonnet] (41s)
+↷ [2/3] Second video title already up to date → ozetler\Channel\def-second.md
+✗ [3/3] Third video title
+  YouTube asked for a sign-in (bot check).
+  hint: Pass --cookies youtube-cookies.txt or --cookies-from-browser firefox.
+Done in 1m12s: 1 summarized, 1 up to date, 1 failed. Details and retry commands: ozetler\last-run.json
+```
+
+Warnings from yt-dlp and other libraries are hidden; failures are shown as one
+short message with a hint when the cause is recognized. Add `-v` to see every
+step, all warnings, and full error text. When output is piped or redirected, the
+live line is replaced by plain text lines.
 
 ## Output
 
@@ -276,11 +344,27 @@ yts -W "https://youtu.be/SOME_VIDEO_ID"
 Install the optional transcription dependency explicitly:
 
 ```sh
-uv tool install --force 'yt-summarizer[whisper] @ git+https://github.com/mthorson/yt-summarizer'
+uv tool install --force 'yt-summarizer[whisper] @ git+https://github.com/talha-devp/yt-summarizer'
 ```
 
 Whisper may download a model and the video's audio, so the first run can take
 several minutes. The program never installs packages at runtime.
+
+Whisper defaults to `--whisper-device auto`, which can fall back to CPU when CUDA
+libraries are unavailable. Use `--whisper-device cuda` to require GPU execution,
+or `--whisper-device cpu` to explicitly use the CPU. This can also be configured
+as `whisper_device = "cuda"` in the TOML settings. GPU execution requires the
+CUDA/cuDNN libraries described in the
+[faster-whisper GPU requirements](https://github.com/SYSTRAN/faster-whisper#gpu).
+
+On Windows, install the optional cuBLAS runtime into the same environment:
+
+```sh
+uv tool install --force --editable ".[whisper,windows-gpu]"
+```
+
+`yts` discovers NVIDIA wheel DLL directories for its own process; it does not
+change the system PATH. The runtime packages require several hundred MB.
 
 Choose a different transcription model with:
 
@@ -304,7 +388,9 @@ It supports normal CLI defaults and custom presets:
 ```toml
 writer = "codex"
 model = "auto"
-language = "en"
+language = "en"            # caption language to read
+summary_language = "tr"    # language to write summaries in
+whisper_device = "auto"    # auto | cuda | cpu
 output_dir = "~/Documents/YouTube Summaries"
 cache_dir = "~/.cache/yt-summarizer"
 chunk_tokens = 30000
@@ -371,6 +457,48 @@ is checked by supported capabilities rather than a hard-coded version number.
 
 Run again with `--whisper`.
 
+`UnicodeDecodeError` mentioning `cp1254`, or `claude returned empty output`
+
+Writer input and output now use UTF-8 explicitly, including on Windows. Restart
+any running `yts` process after updating. A transcript cached before the writer
+failed is reused on the next run.
+
+`Sign in to confirm you're not a bot`
+
+Open YouTube in your browser, sign in and complete any verification it shows.
+Then select that browser, for example if you use Firefox:
+
+```sh
+yts --writer claude --whisper --sleep 10 --cookies-from-browser firefox videos.txt
+```
+
+Alternatively, pass `--cookies youtube-cookies.txt` with an existing
+Netscape-format cookie file. Choose one cookie source per run. Cookies apply to
+playlist expansion, metadata, captions, and audio downloads. Browser extraction
+can fail when a browser locks or encrypts its cookie database; in that case use
+an exported file following the [yt-dlp cookie instructions](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp).
+Cookies do not guarantee that YouTube will accept a request.
+
+`SSL: INVALID_SESSION_ID`
+
+The HTTPS connection failed before YouTube could return content. If a network
+filter such as GoodbyeDPI is running, compare with it temporarily disabled or
+on another connection. Whisper and cookies do not repair a broken TLS handshake.
+
+`Requested format is not available`
+
+Metadata retrieval allows missing media formats so available captions can still
+be used. Whisper requires downloadable audio, so it can still fail for the same
+video. Rerun with `-v` to see yt-dlp's warnings about the underlying
+extraction issue.
+
+`No supported JavaScript runtime could be found`
+
+Install Deno or Node.js 22+. `yts` also searches the standard Deno installer and
+Windows winget locations when Deno is missing from the terminal's PATH. Restart
+the running `yts` command after installing or updating; no manual PATH refresh
+is needed for those Deno locations.
+
 A batch stopped partway through
 
 You may have hit a subscription or rate limit. Long-video chunk notes are cached,
@@ -408,7 +536,7 @@ yts -p "What should I actually do with this information?" \
 Install the checkout as an editable command:
 
 ```sh
-git clone https://github.com/mthorson/yt-summarizer
+git clone https://github.com/talha-devp/yt-summarizer
 cd yt-summarizer
 ./install.sh
 ```

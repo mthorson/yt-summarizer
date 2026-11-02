@@ -32,17 +32,103 @@ SALES_INTENT_INSTRUCTION = (
     "that clearly."
 )
 
-# Default user instruction (TL;DR + key takeaways). Overridable with
-# --prompt "<text>" or --prompt-file <path>.
-DEFAULT_PROMPT = (
-    "Summarize this YouTube video. Structure the output exactly as:\n\n"
-    "**TL;DR**: 2 to 4 sentences capturing the subject and main point.\n\n"
-    "**Key takeaways**\n"
-    "- A bulleted list of the main points, arguments, or steps, in the order they "
-    "appear.\n"
-    "- Be specific and concrete; prefer the video's actual claims over vague "
-    "generalities.\n"
-)
+# Built-in summary headings per output language. The writer is told to use
+# these exact labels, and the CLI checks for them to catch malformed output.
+# Languages not listed here still work; the writer translates the headings
+# itself and the heading check is skipped.
+SUMMARY_HEADINGS: dict[str, tuple[str, str]] = {
+    "en": ("TL;DR", "Key takeaways"),
+    "tr": ("Kısa Özet", "Öne Çıkan Noktalar"),
+    "de": ("Kurzfassung", "Wichtigste Punkte"),
+    "fr": ("En bref", "Points clés"),
+    "es": ("Resumen", "Puntos clave"),
+    "it": ("In breve", "Punti chiave"),
+    "pt": ("Resumo", "Pontos principais"),
+    "nl": ("Samenvatting", "Belangrijkste punten"),
+    "ru": ("Кратко", "Ключевые выводы"),
+    "ar": ("باختصار", "أهم النقاط"),
+    "ja": ("要約", "主なポイント"),
+    "zh": ("摘要", "要点"),
+    "ko": ("요약", "핵심 내용"),
+}
+
+LANGUAGE_NAMES: dict[str, str] = {
+    "en": "English",
+    "tr": "Turkish",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "nl": "Dutch",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "ko": "Korean",
+    "az": "Azerbaijani",
+    "pl": "Polish",
+    "uk": "Ukrainian",
+    "hi": "Hindi",
+    "fa": "Persian",
+    "el": "Greek",
+    "sv": "Swedish",
+}
+
+
+def normalize_language(value: str | None) -> str | None:
+    """Return a lower-case code such as ``"tr"`` (``tr-TR`` -> ``tr``).
+
+    Free-form names (``"turkish"``, ``"Türkçe"``) are mapped back to a code
+    when recognised and otherwise passed through unchanged.
+    """
+    if not value or not str(value).strip():
+        return None
+    text = str(value).strip()
+    code = text.lower().replace("_", "-").split("-", 1)[0]
+    if code in LANGUAGE_NAMES:
+        return code
+    aliases = {name.lower(): code for code, name in LANGUAGE_NAMES.items()}
+    aliases.update({"türkçe": "tr", "turkce": "tr", "deutsch": "de"})
+    return aliases.get(text.lower(), text)
+
+
+def language_name(code: str) -> str:
+    return LANGUAGE_NAMES.get(code, code)
+
+
+def summary_prompt(language: str | None = None) -> str:
+    """The built-in summary instruction, optionally in a given output language."""
+    code = normalize_language(language) or "en"
+    headings = SUMMARY_HEADINGS.get(code)
+    short, points = headings or ("TL;DR", "Key takeaways")
+    prompt = (
+        "Summarize this YouTube video. Structure the output exactly as:\n\n"
+        f"**{short}**: 2 to 4 sentences capturing the subject and main point.\n\n"
+        f"**{points}**\n"
+        "- A bulleted list of the main points, arguments, or steps, in the order "
+        "they appear.\n"
+        "- Be specific and concrete; prefer the video's actual claims over vague "
+        "generalities.\n"
+    )
+    if code != "en" and not headings:
+        prompt += f"\nTranslate the two headings above into {language_name(code)}.\n"
+    return prompt
+
+
+def language_instruction(language: str) -> str:
+    name = language_name(normalize_language(language) or language)
+    return (
+        f"Write the entire response in {name}, including headings, regardless of "
+        "the language of the video, transcript, or intermediate notes. Keep proper "
+        "names, quotations that must stay verbatim, and links unchanged."
+    )
+
+
+# Default user instruction (TL;DR + key takeaways, in English). Overridable
+# with --prompt "<text>" or --prompt-file <path>; the output language is set
+# with --summary-lang.
+DEFAULT_PROMPT = summary_prompt("en")
 
 
 BUILTIN_PRESETS = {

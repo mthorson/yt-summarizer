@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlparse
 
 from yt_dlp import YoutubeDL
 
+from . import ytdlp
+
 _BARE_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -69,7 +71,7 @@ def _normalize(raw: str) -> str:
     return raw
 
 
-def _expand(url: str) -> list[str]:
+def _expand(url: str, *, ydl_opts: dict | None = None) -> list[str]:
     """Expand a playlist/channel URL into individual video URLs.
 
     Uses a flat extraction (no per-video network calls) purely to enumerate
@@ -79,12 +81,7 @@ def _expand(url: str) -> list[str]:
     if video_id:
         return [_watch_url(video_id)]
 
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": "in_playlist",
-        "skip_download": True,
-    }
+    opts = ytdlp.options(ydl_opts, extract_flat="in_playlist", skip_download=True)
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -112,7 +109,9 @@ def _expand(url: str) -> list[str]:
     return [url]
 
 
-def resolve_inputs(raw_inputs: Iterable[str]) -> list[str]:
+def resolve_inputs(
+    raw_inputs: Iterable[str], *, ydl_opts: dict | None = None
+) -> list[str]:
     """Turn CLI args into a de-duplicated, ordered list of video URLs."""
     seed: list[str] = []
     for raw in raw_inputs:
@@ -123,7 +122,7 @@ def resolve_inputs(raw_inputs: Iterable[str]) -> list[str]:
 
     expanded: list[str] = []
     for item in seed:
-        expanded.extend(_expand(_normalize(item)))
+        expanded.extend(_expand(_normalize(item), ydl_opts=ydl_opts))
 
     # de-dupe while preserving order
     seen: set[str] = set()
