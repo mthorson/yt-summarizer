@@ -85,6 +85,46 @@ class CliTest(unittest.TestCase):
         args = cli.build_parser().parse_args(["-d"])
         self.assertTrue(args.doctor)
 
+    def test_browser_cookies_reach_metadata_captions_and_whisper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _args(tmp)
+            args.cookies_from_browser = "firefox"
+            args.whisper_device = "cuda"
+            args.whisper = True
+            url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            info = {"id": "dQw4w9WgXcQ", "channel": "Channel"}
+            with (
+                mock.patch(
+                    "yt_summarizer.cli.fetch.get_info", return_value=info
+                ) as meta,
+                mock.patch(
+                    "yt_summarizer.cli.fetch.extract_captions", return_value=None
+                ) as captions,
+                mock.patch(
+                    "yt_summarizer.cli.fetch.whisper_transcribe",
+                    return_value=("Türkçe konuşma", []),
+                ) as whisper,
+            ):
+                record = cli._get_record(url, args, ProgressReporter(quiet=True))
+            options = {"cookiesfrombrowser": ("firefox",)}
+            meta.assert_called_once_with(url, ydl_opts=options)
+            captions.assert_called_once_with(info, "en", ydl_opts=options)
+            whisper.assert_called_once_with(
+                url,
+                "base",
+                device="cuda",
+                ydl_opts=options,
+                on_progress=mock.ANY,
+            )
+            self.assertEqual(record["transcript"], "Türkçe konuşma")
+
+    def test_missing_cookie_file_fails_before_starting_a_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("yt_summarizer.cli.summarize.resolve_writer") as writer:
+                result = cli.main(["--cookies", os.path.join(tmp, "missing.txt")])
+            self.assertEqual(result, 1)
+            writer.assert_not_called()
+
     def test_long_video_chunk_notes_resume_from_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             args = _args(tmp)
@@ -128,7 +168,7 @@ class CliTest(unittest.TestCase):
                 mock.patch(
                     "yt_summarizer.cli.resolve_inputs",
                     return_value=["https://youtu.be/aaaaaaaaaaa", "bad url"],
-                ),
+                ) as resolve,
                 mock.patch(
                     "yt_summarizer.cli.summarize.resolve_writer", return_value="codex"
                 ),
@@ -142,9 +182,21 @@ class CliTest(unittest.TestCase):
                     ],
                 ),
             ):
-                result = cli.main(["--quiet", "--report", report, "playlist"])
+                result = cli.main(
+                    [
+                        "--quiet",
+                        "--report",
+                        report,
+                        "--cookies-from-browser",
+                        "firefox",
+                        "playlist",
+                    ]
+                )
 
             self.assertEqual(result, 2)
+            resolve.assert_called_once_with(
+                ["playlist"], ydl_opts={"cookiesfrombrowser": ("firefox",)}
+            )
             with open(report, encoding="utf-8") as handle:
                 data = json.load(handle)
             self.assertEqual(data["succeeded"], 1)
@@ -176,7 +228,7 @@ class CliTest(unittest.TestCase):
                 ) as get_record,
                 mock.patch(
                     "yt_summarizer.summarize.summarize",
-                    return_value="**TL;DR**: New\n\n**Key takeaways**\n- One",
+                    return_value="**TL;DR**: New.\n\n**Key takeaways**\n- One.",
                 ),
             ):
                 status, returned_path = cli.process_one(
@@ -233,6 +285,87 @@ class CliTest(unittest.TestCase):
                 summarize_mock.call_args.kwargs["system_prompt"],
                 CUSTOM_SYSTEM_PROMPT,
             )
+
+    def test_summary_lang_flag_and_config(self) -> None:
+        self.assertIsNone(cli.build_parser().parse_args([]).summary_lang)
+        self.assertEqual(
+            cli.build_parser().parse_args(["-sl", "tr"]).summary_lang, "tr"
+        )
+        self.assertEqual(
+            cli.build_parser().parse_args(["--summary-lang", "de"]).summary_lang,
+            "de",
+        )
+        configured = cli.build_parser({"summary_language": "tr"}).parse_args([])
+        self.assertEqual(configured.summary_lang, "tr")
+        # -sl must not collide with -s/--sleep.
+        args = cli.build_parser().parse_args(["-s", "2", "-sl", "tr"])
+        self.assertEqual((args.sleep, args.summary_lang), (2.0, "tr"))
+
+    def test_localized_summary_prompt_and_validation(self) -> None:
+        prompt = cli.localize_prompt(DEFAULT_PROMPT, "tr")
+        self.assertIn("**Kısa Özet**", prompt)
+        self.assertIn("Turkish", prompt)
+        self.assertEqual(cli.localize_prompt(DEFAULT_PROMPT, None), DEFAULT_PROMPT)
+        headings = cli.expected_headings("summary", prompt, "tr")
+        self.assertEqual(headings, ("Kısa Özet", "Öne Çıkan Noktalar"))
+        cli._validate_result(
+            "summary", "**KISA ÖZET**: x\n\n**Öne çıkan noktalar**\n- y", headings
+        )
+        with self.assertRaises(cli.summarize.SummarizeError):
+            cli._validate_result("summary", "**TL;DR**: x", headings)
+        # Unknown languages translate headings themselves; no strict check.
+        swahili = cli.localize_prompt(DEFAULT_PROMPT, "Swahili")
+        self.assertIn("Translate the two headings", swahili)
+        self.assertIsNone(cli.expected_headings("summary", swahili, "Swahili"))
+        # Custom prompts only get the language instruction appended.
+        custom = cli.localize_prompt("List the steps.", "tr")
+        self.assertTrue(custom.startswith("List the steps."))
+        self.assertIsNone(cli.expected_headings("custom", custom, "tr"))
+
+    def test_turkish_summary_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _args(tmp)
+            args.summary_lang = "tr"
+            record = {
+                "video_id": "dQw4w9WgXcQ",
+                "title": "Başlık",
+                "channel": "Channel",
+                "webpage_url": "https://youtu.be/dQw4w9WgXcQ",
+                "transcript": "Transcript",
+            }
+            prompt = cli.localize_prompt(DEFAULT_PROMPT, "tr")
+            reply = "**Kısa Özet**: Özet.\n\n**Öne Çıkan Noktalar**\n- Bir."
+            with (
+                mock.patch("yt_summarizer.cli._get_record", return_value=record),
+                mock.patch(
+                    "yt_summarizer.summarize.summarize", return_value=reply
+                ) as writer,
+            ):
+                status, path = cli.process_one(
+                    "https://youtu.be/dQw4w9WgXcQ",
+                    args,
+                    prompt,
+                    "claude",
+                    ProgressReporter(quiet=True),
+                )
+            self.assertIn("summarized", status)
+            self.assertTrue(path.endswith(".md"))
+            self.assertNotIn("--custom", path)
+            self.assertIn("Turkish", writer.call_args.kwargs["user_prompt"])
+
+    def test_describe_error_gives_short_message_and_hint(self) -> None:
+        exc = cli.DownloadError(
+            "ERROR: [youtube] abc: Sign in to confirm you're not a bot. "
+            "Use --cookies-from-browser or --cookies for the authentication."
+        )
+        message, hint = cli.describe_error(exc)
+        self.assertEqual(message, "YouTube asked for a sign-in (bot check).")
+        self.assertIn("--cookies", hint)
+        message, hint = cli.describe_error(RuntimeError("x" * 1000))
+        self.assertLess(len(message), 400)
+        self.assertIsNone(hint)
+        message, _ = cli.describe_error(cli.summarize.SummarizeError("quota"))
+        self.assertEqual(message, "quota")
 
 
 if __name__ == "__main__":

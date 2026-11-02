@@ -4,7 +4,7 @@ version = "0.1.1"
 description = "Batch-summarize YouTube videos with subscription-backed AI CLIs"
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [{ name = "Matt Thorson" }]
+authors = [{ name = "Matt Thorson" }, { name = "talha-devp" }]
 requires-python = ">=3.10"
 keywords = ["youtube", "summarization", "codex", "claude", "transcription"]
 classifiers = [
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mthorson/yt-summarizer"
-Repository = "https://github.com/mthorson/yt-summarizer"
-Issues = "https://github.com/mthorson/yt-summarizer/issues"
+Homepage = "https://github.com/talha-devp/yt-summarizer"
+Repository = "https://github.com/talha-devp/yt-summarizer"
+Issues = "https://github.com/talha-devp/yt-summarizer/issues"
 
 [project.optional-dependencies]
 # Local transcription fallback for videos that have no captions.
@@ -40,6 +40,12 @@ whisper = [
     "faster-whisper>=1.0.0",
     # faster-whisper 1.2.1 passes metadata_errors, removed in PyAV 19.
     "av>=11,<19",
+]
+
+# Optional NVIDIA runtime DLLs for Windows GPU transcription.
+# Install together with whisper: uv sync --extra whisper --extra windows-gpu
+windows-gpu = [
+    "nvidia-cublas-cu12>=12,<13; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

@@ -13,27 +13,27 @@ import json
 import os
 import re
 import tempfile
-import urllib.request
+from collections.abc import Callable
 
 from yt_dlp import YoutubeDL
 
+from . import ytdlp
 from .errors import FetchError
-
-_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 
 # --------------------------------------------------------------------------- #
 # Metadata
 # --------------------------------------------------------------------------- #
-def get_info(url: str) -> dict:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "writesubtitles": False,
-        "writeautomaticsub": False,
-        "js_runtimes": {"deno": {}, "node": {}},
-    }
+def get_info(url: str, *, ydl_opts: dict | None = None) -> dict:
+    opts = ytdlp.options(
+        ydl_opts,
+        skip_download=True,
+        # Captions and metadata can be available even when audio/video formats
+        # are not. Only the Whisper download needs a playable media format.
+        ignore_no_formats_error=True,
+        writesubtitles=False,
+        writeautomaticsub=False,
+    )
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if not info:
@@ -62,9 +62,13 @@ def _pick_track(
     return None
 
 
-def _fetch_url(url: str, max_bytes: int = 50 * 1024 * 1024) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": _UA})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+def _fetch_url(
+    url: str, max_bytes: int = 50 * 1024 * 1024, *, ydl_opts: dict | None = None
+) -> str:
+    opts = ytdlp.options(ydl_opts)
+    # Use yt-dlp's transport so caption requests share the supplied cookies and
+    # metadata headers instead of silently making an unauthenticated request.
+    with YoutubeDL(opts) as ydl, ydl.urlopen(url) as resp:
         raw = resp.read(max_bytes + 1)
         if len(raw) > max_bytes:
             raise FetchError("caption track exceeded the 50 MiB safety limit")
@@ -144,7 +148,9 @@ def _parse_vtt(raw: str) -> str:
     return " ".join(segment["text"] for segment in _parse_vtt_segments(raw))
 
 
-def _extract_from_track(track: list) -> tuple[str, list[dict]] | None:
+def _extract_from_track(
+    track: list, *, ydl_opts: dict | None = None
+) -> tuple[str, list[dict]] | None:
     """Given a yt-dlp caption track (list of format dicts), download & parse."""
     by_ext = {fmt.get("ext"): fmt for fmt in track if fmt.get("url")}
     for ext in ("json3", "srv3", "srv1", "vtt"):
@@ -152,7 +158,7 @@ def _extract_from_track(track: list) -> tuple[str, list[dict]] | None:
         if not fmt:
             continue
         try:
-            raw = _fetch_url(fmt["url"])
+            raw = _fetch_url(fmt["url"], ydl_opts=ydl_opts)
         except Exception:
             continue
         try:
@@ -169,15 +175,20 @@ def _extract_from_track(track: list) -> tuple[str, list[dict]] | None:
     return None
 
 
-def extract_captions(info: dict, lang: str) -> tuple[str, str, str, list[dict]] | None:
+def extract_captions(
+    info: dict, lang: str, *, ydl_opts: dict | None = None
+) -> tuple[str, str, str, list[dict]] | None:
     """Return (transcript, source, actual language, timed segments), or None."""
     manual = info.get("subtitles") or {}
     auto = info.get("automatic_captions") or {}
+    caption_opts = dict(ydl_opts or {})
+    if info.get("http_headers"):
+        caption_opts["http_headers"] = info["http_headers"]
 
     selected = _pick_track(manual, lang)
     if selected:
         actual_lang, track = selected
-        result = _extract_from_track(track)
+        result = _extract_from_track(track, ydl_opts=caption_opts)
         if result:
             text, segments = result
             return text, "captions", actual_lang, segments
@@ -185,7 +196,7 @@ def extract_captions(info: dict, lang: str) -> tuple[str, str, str, list[dict]] 
     selected = _pick_track(auto, lang, prefer_original=True)
     if selected:
         actual_lang, track = selected
-        result = _extract_from_track(track)
+        result = _extract_from_track(track, ydl_opts=caption_opts)
         if result:
             text, segments = result
             return text, "auto-captions", actual_lang, segments
@@ -198,6 +209,7 @@ def extract_captions(info: dict, lang: str) -> tuple[str, str, str, list[dict]] 
 # --------------------------------------------------------------------------- #
 def _ensure_whisper_model():
     """Return WhisperModel or explain how to install the optional dependency."""
+    _configure_windows_cuda_libraries()
     try:
         from faster_whisper import WhisperModel
 
@@ -211,19 +223,54 @@ def _ensure_whisper_model():
         ) from exc
 
 
-def whisper_transcribe(url: str, model_size: str) -> tuple[str, list[dict]]:
+def _configure_windows_cuda_libraries() -> None:
+    """Expose optional NVIDIA wheel DLLs to CTranslate2 in this process only."""
+    if os.name != "nt":
+        return
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    paths = os.environ.get("PATH", "").split(os.pathsep)
+    for package in (
+        "nvidia-cublas-cu12",
+        "nvidia-cuda-nvrtc-cu12",
+        "nvidia-cudnn-cu12",
+    ):
+        try:
+            installed = distribution(package)
+        except PackageNotFoundError:
+            continue
+        for file in installed.files or []:
+            if str(file).lower().endswith(".dll"):
+                directory = os.path.dirname(str(installed.locate_file(file)))
+                if directory not in paths:
+                    paths.insert(0, directory)
+    os.environ["PATH"] = os.pathsep.join(paths)
+
+
+def whisper_transcribe(
+    url: str,
+    model_size: str,
+    *,
+    device: str = "auto",
+    ydl_opts: dict | None = None,
+    on_progress: Callable[[str], None] | None = None,
+) -> tuple[str, list[dict]]:
+    """Download the audio and transcribe it locally.
+
+    ``on_progress`` receives short human-readable status strings such as
+    ``"downloading audio"`` or ``"transcribing 42%"``.
+    """
+    if device not in {"auto", "cuda", "cpu"}:
+        raise FetchError(f"Unsupported Whisper device: {device}")
+    report = on_progress or (lambda _message: None)
+    # Model downloads otherwise draw tqdm bars over the live progress display.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     WhisperModel = _ensure_whisper_model()
 
     with tempfile.TemporaryDirectory() as tmp:
         outtmpl = os.path.join(tmp, "%(id)s.%(ext)s")
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl,
-            "js_runtimes": {"deno": {}, "node": {}},
-        }
+        opts = ytdlp.options(ydl_opts, format="bestaudio/best", outtmpl=outtmpl)
+        report("downloading audio")
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             audio_path = ydl.prepare_filename(info)
@@ -236,24 +283,40 @@ def whisper_transcribe(url: str, model_size: str) -> tuple[str, list[dict]]:
             audio_path = files[0]
 
         def transcribe(device: str):
+            report(f"loading Whisper model ({model_size}, {device})")
             model = WhisperModel(model_size, device=device, compute_type="int8")
-            segments, _ = model.transcribe(audio_path, vad_filter=True)
-            return [
-                {
-                    "start": round(float(seg.start), 3),
-                    "duration": round(float(seg.end - seg.start), 3),
-                    "text": seg.text.strip(),
-                }
-                for seg in segments
-                if seg.text.strip()
-            ]
+            segments, meta = model.transcribe(audio_path, vad_filter=True)
+            total = float(getattr(meta, "duration", 0) or 0)
+            report("transcribing")
+            timed = []
+            for seg in segments:
+                if total > 0:
+                    percent = min(99, int(float(seg.end) / total * 100))
+                    report(f"transcribing {percent}%")
+                if seg.text.strip():
+                    timed.append(
+                        {
+                            "start": round(float(seg.start), 3),
+                            "duration": round(float(seg.end - seg.start), 3),
+                            "text": seg.text.strip(),
+                        }
+                    )
+            return timed
 
         try:
-            timed = transcribe("auto")
+            timed = transcribe(device)
         except RuntimeError as exc:
+            if device == "cuda":
+                raise FetchError(
+                    "Whisper GPU execution failed; CPU fallback is disabled by "
+                    f"--whisper-device cuda. Check the NVIDIA CUDA libraries. {exc}"
+                ) from exc
             detail = str(exc).lower()
-            if not any(name in detail for name in ("cuda", "cublas", "cudnn")):
+            if device != "auto" or not any(
+                name in detail for name in ("cuda", "cublas", "cudnn")
+            ):
                 raise
+            report("GPU unavailable, falling back to CPU")
             timed = transcribe("cpu")
         text = " ".join(segment["text"] for segment in timed)
         return re.sub(r"\s+", " ", text).strip(), timed

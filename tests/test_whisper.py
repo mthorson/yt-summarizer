@@ -10,6 +10,22 @@ from yt_summarizer import fetch
 
 
 class WhisperTest(unittest.TestCase):
+    @mock.patch("yt_summarizer.fetch.os.path.isfile", return_value=True)
+    @mock.patch("yt_summarizer.fetch.YoutubeDL")
+    @mock.patch("yt_summarizer.fetch._ensure_whisper_model")
+    def test_explicit_gpu_does_not_silently_fall_back(
+        self, ensure_model, youtube_dl, _isfile
+    ):
+        model = ensure_model.return_value
+        model.return_value.transcribe.side_effect = RuntimeError(
+            "Library cublas64_12.dll is not found"
+        )
+        ydl = youtube_dl.return_value.__enter__.return_value
+        ydl.prepare_filename.return_value = "audio.webm"
+        with self.assertRaisesRegex(fetch.FetchError, "CPU fallback is disabled"):
+            fetch.whisper_transcribe("url", "base", device="cuda")
+        model.assert_called_once_with("base", device="cuda", compute_type="int8")
+
     @unittest.skipUnless(
         importlib.util.find_spec("faster_whisper"), "Whisper extra is not installed"
     )
@@ -45,11 +61,17 @@ class WhisperTest(unittest.TestCase):
         ydl.extract_info.return_value = {"id": "video"}
         ydl.prepare_filename.return_value = "/tmp/audio.webm"
 
-        text, timed = fetch.whisper_transcribe("url", "tiny")
+        text, timed = fetch.whisper_transcribe(
+            "url", "tiny", ydl_opts={"cookiefile": "youtube-cookies.txt"}
+        )
 
         self.assertEqual(text, "hello")
         self.assertEqual(timed[0]["duration"], 1.0)
         self.assertEqual(model.call_args_list[1].kwargs["device"], "cpu")
+        self.assertEqual(
+            youtube_dl.call_args.args[0]["cookiefile"], "youtube-cookies.txt"
+        )
+        self.assertFalse(youtube_dl.call_args.args[0].get("ignore_no_formats_error"))
 
 
 if __name__ == "__main__":

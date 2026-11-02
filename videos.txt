@@ -1,0 +1,13 @@
+# Video list for yt-summarizer. Run it with:
+#   yts -sl tr videos.txt
+#
+# One input per line. Lines starting with # and blank lines are ignored.
+# Accepted inputs:
+#   https://www.youtube.com/watch?v=VIDEO_ID
+#   https://youtu.be/VIDEO_ID
+#   https://www.youtube.com/live/VIDEO_ID
+#   https://www.youtube.com/shorts/VIDEO_ID
+#   VIDEO_ID                                  (the bare 11-character ID)
+#   https://www.youtube.com/playlist?list=... (expanded into its videos)
+
+https://www.youtube.com/live/iB2t6FxPF4M
